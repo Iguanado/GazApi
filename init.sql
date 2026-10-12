@@ -1,3 +1,17 @@
+CREATE TABLE polzovateli (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE devices (
+    device_id TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES polzovateli(id)
+);
+
+CREATE INDEX user_devices_in
+ON devices (user_id);
+
+
 CREATE TABLE pokazaniya (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     device_id TEXT NOT NULL,
