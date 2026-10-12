@@ -1,69 +1,31 @@
-import os
-from datetime import datetime
-
 import psycopg
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field, FiniteFloat
 
-load_dotenv()
+from database import (
+    insert_device,
+    insert_pokazaniya,
+    insert_user,
+    select_device_statistics,
+    select_user_devices_statistics,
+    select_user_statistics,
+)
+from schemas import (
+    DeviceCreate,
+    PokazaniyaCreate,
+    ReadStatistic,
+    UserCreate,
+    UserStatistic,
+)
+
 app = FastAPI()
-
-
-class PokazaniyaCreate(BaseModel):
-    x: FiniteFloat
-    y: FiniteFloat
-    z: FiniteFloat
-
-
-class ReadStatistic(BaseModel):
-    device_id: str
-    start: datetime | None = None
-    end: datetime | None = None
-
-
-class UserCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100, pattern=r"\S", examples=["Максим"])
-
-
-class DeviceCreate(BaseModel):
-    device_id: str = Field(min_length=1, max_length=100, pattern=r"\S", examples=["sensor-1"])
-
-
-class UserStatistic(BaseModel):
-    user_id: int
-    start: datetime | None = None
-    end: datetime | None = None
-
-
-def get_connection():
-    return psycopg.connect(
-        host=os.environ["DB_HOST"],
-        port=int(os.environ["DB_PORT"]),
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-    )
 
 
 @app.post("/devices/{device_id}/pokazaniya", status_code=201, tags=["Показания"])
 def create_pokazaniya(device_id: str, payload: PokazaniyaCreate):
-    with get_connection() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT device_id FROM devices WHERE device_id = %s", (device_id,))
+    row = insert_pokazaniya(device_id, payload.x, payload.y, payload.z)
 
-        if cursor.fetchone() is None:
-            raise HTTPException(status_code=404, detail="Устройство не зарегистрировано")
-
-        cursor.execute(
-            """
-            INSERT INTO pokazaniya (device_id, x, y, z)
-            VALUES (%s, %s, %s, %s)
-            RETURNING id, device_id, vremya_zapisi, x, y, z
-            """,
-            (device_id, payload.x, payload.y, payload.z),
-        )
-
-        row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Устройство не зарегистрировано")
 
     return {
         "id": row[0],
@@ -90,43 +52,7 @@ def read_statistics(params: ReadStatistic = Depends()):  # noqa: B008
     if start is not None and end is not None and start >= end:
         raise HTTPException(status_code=422, detail="start должен быть раньше end")
 
-    conditions = ["device_id = %s"]
-    sql_params = [device_id]
-
-    if start is not None:
-        conditions.append("vremya_zapisi >= %s")
-        sql_params.append(start)
-
-    if end is not None:
-        conditions.append("vremya_zapisi < %s")
-        sql_params.append(end)
-
-    with get_connection() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            f"""
-            SELECT
-                COUNT(*),
-                MIN(x),
-                MAX(x),
-                COALESCE(SUM(x), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY x),
-
-                MIN(y),
-                MAX(y),
-                COALESCE(SUM(y), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY y),
-
-                MIN(z),
-                MAX(z),
-                COALESCE(SUM(z), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY z)
-            FROM pokazaniya
-            WHERE {" AND ".join(conditions)}
-            """,
-            sql_params,
-        )
-
-        row = cursor.fetchone()
+    row = select_device_statistics(device_id, start, end)
 
     return {
         "device_id": device_id,
@@ -156,17 +82,7 @@ def read_statistics(params: ReadStatistic = Depends()):  # noqa: B008
 
 @app.post("/users", status_code=201, tags=["Пользователи"])
 def create_user(payload: UserCreate):
-    with get_connection() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO polzovateli (name)
-            VALUES (%s)
-            RETURNING id, name
-            """,
-            (payload.name.strip(),),
-        )
-
-        row = cursor.fetchone()
+    row = insert_user(payload.name)
 
     return {
         "id": row[0],
@@ -179,22 +95,10 @@ def create_device(user_id: int, payload: DeviceCreate):
     device_id = payload.device_id.strip()
 
     try:
-        with get_connection() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT id FROM polzovateli WHERE id = %s", (user_id,))
+        row = insert_device(user_id, device_id)
 
-            if cursor.fetchone() is None:
-                raise HTTPException(status_code=404, detail="Пользователь не найден")
-
-            cursor.execute(
-                """
-                INSERT INTO devices (device_id, user_id)
-                VALUES (%s, %s)
-                RETURNING device_id, user_id
-                """,
-                (device_id, user_id),
-            )
-
-            row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     except psycopg.errors.UniqueViolation:
         raise HTTPException(status_code=409, detail="Устройство с таким идентификатором уже существует") from None
@@ -223,49 +127,10 @@ def read_user_statistics(params: UserStatistic = Depends()):  # noqa: B008
     if start is not None and end is not None and start >= end:
         raise HTTPException(status_code=422, detail="start должен быть раньше end")
 
-    conditions = ["d.user_id = %s"]
-    sql_params = [user_id]
+    row = select_user_statistics(user_id, start, end)
 
-    if start is not None:
-        conditions.append("p.vremya_zapisi >= %s")
-        sql_params.append(start)
-
-    if end is not None:
-        conditions.append("p.vremya_zapisi < %s")
-        sql_params.append(end)
-
-    with get_connection() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT id FROM polzovateli WHERE id = %s", (user_id,))
-
-        if cursor.fetchone() is None:
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
-
-        cursor.execute(
-            f"""
-            SELECT
-                COUNT(*),
-                MIN(p.x),
-                MAX(p.x),
-                COALESCE(SUM(p.x), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.x),
-
-                MIN(p.y),
-                MAX(p.y),
-                COALESCE(SUM(p.y), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.y),
-
-                MIN(p.z),
-                MAX(p.z),
-                COALESCE(SUM(p.z), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.z)
-            FROM pokazaniya AS p
-            JOIN devices AS d ON p.device_id = d.device_id
-            WHERE {" AND ".join(conditions)}
-            """,
-            sql_params,
-        )
-
-        row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     return {
         "user_id": user_id,
@@ -308,56 +173,10 @@ def read_user_devices_statistics(params: UserStatistic = Depends()):  # noqa: B0
     if start is not None and end is not None and start >= end:
         raise HTTPException(status_code=422, detail="start должен быть раньше end")
 
-    join_conditions = ["p.device_id = d.device_id"]
-    sql_params = []
+    rows = select_user_devices_statistics(user_id, start, end)
 
-    if start is not None:
-        join_conditions.append("p.vremya_zapisi >= %s")
-        sql_params.append(start)
-
-    if end is not None:
-        join_conditions.append("p.vremya_zapisi < %s")
-        sql_params.append(end)
-
-    sql_params.append(user_id)
-
-    with get_connection() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT id FROM polzovateli WHERE id = %s", (user_id,))
-
-        if cursor.fetchone() is None:
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
-
-        cursor.execute(
-            f"""
-            SELECT
-                d.device_id,
-                COUNT(p.id),
-
-                MIN(p.x),
-                MAX(p.x),
-                COALESCE(SUM(p.x), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.x),
-
-                MIN(p.y),
-                MAX(p.y),
-                COALESCE(SUM(p.y), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.y),
-
-                MIN(p.z),
-                MAX(p.z),
-                COALESCE(SUM(p.z), 0),
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.z)
-            FROM devices AS d
-            LEFT JOIN pokazaniya AS p
-                ON {" AND ".join(join_conditions)}
-            WHERE d.user_id = %s
-            GROUP BY d.device_id
-            ORDER BY d.device_id
-            """,
-            sql_params,
-        )
-
-        rows = cursor.fetchall()
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     devices_statistics = []
 
